@@ -77,6 +77,8 @@ export interface Store {
   // Fetches the .torrent metadata for a search result (via magnet if not yet
   // cached) and exports it to the configured download folder.
   fetchAndExportTorrent: (input: { id: string; name: string; magnet: string }) => void;
+  // Streams the torrent's main file to a media player, even while downloading.
+  playTorrent: (input: { id: string; name: string }) => void;
 
   notice: string | null;
   setNotice: (s: string | null) => void;
