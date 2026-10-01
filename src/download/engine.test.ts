@@ -171,3 +171,83 @@ describe("TorrentEngine.getStreamUrl", () => {
     engine.destroy();
   });
 });
+
+describe("TorrentEngine.filePaths", () => {
+  it("lists a torrent's file paths, and nothing for an unknown id", async () => {
+    const { TorrentEngine } = await import("./engine");
+    const engine = new TorrentEngine();
+    const fakeTorrent = Object.assign(new EventEmitter(), {
+      files: [{ path: "Course/1.mp4" }, { path: "Course/2.mp4" }],
+    });
+    (engine as unknown as { torrents: Map<string, unknown> }).torrents.set("course", fakeTorrent);
+
+    expect(engine.filePaths("course")).toEqual(["Course/1.mp4", "Course/2.mp4"]);
+    expect(engine.filePaths("missing")).toEqual([]);
+    engine.destroy();
+  });
+});
+
+describe("TorrentEngine uTP opt-out (TORLINK_NO_UTP)", () => {
+  it("leaves uTP on by default, the way other BitTorrent clients ship it", async () => {
+    const { TorrentEngine } = await import("./engine");
+    const original = process.env.TORLINK_NO_UTP;
+    delete process.env.TORLINK_NO_UTP;
+    try {
+      const engine = new TorrentEngine();
+      engine.add(
+        "test-id",
+        "magnet:?xt=urn:btih:0000000000000000000000000000000000000000",
+        "/downloads",
+        {},
+      );
+      engine.destroy();
+    } finally {
+      if (original === undefined) delete process.env.TORLINK_NO_UTP;
+      else process.env.TORLINK_NO_UTP = original;
+    }
+    expect(constructorCalls).toHaveLength(1);
+    expect(constructorCalls[0]).not.toHaveProperty("utp", false);
+  });
+
+  it("passes utp:false when TORLINK_NO_UTP is set, so utp-native cannot exhaust sockets", async () => {
+    const { TorrentEngine } = await import("./engine");
+    const original = process.env.TORLINK_NO_UTP;
+    process.env.TORLINK_NO_UTP = "1";
+    try {
+      const engine = new TorrentEngine();
+      engine.add(
+        "test-id",
+        "magnet:?xt=urn:btih:0000000000000000000000000000000000000000",
+        "/downloads",
+        {},
+      );
+      engine.destroy();
+    } finally {
+      if (original === undefined) delete process.env.TORLINK_NO_UTP;
+      else process.env.TORLINK_NO_UTP = original;
+    }
+    expect(constructorCalls).toHaveLength(1);
+    expect(constructorCalls[0]).toMatchObject({ utp: false });
+  });
+});
+
+describe("TorrentEngine ready handler", () => {
+  it("calls onReady once webtorrent has checked the pieces on disk", async () => {
+    const { TorrentEngine } = await import("./engine");
+    const engine = new TorrentEngine();
+    const onReady = vi.fn();
+    engine.add(
+      "test-id",
+      "magnet:?xt=urn:btih:0000000000000000000000000000000000000000",
+      "/downloads",
+      { onReady },
+    );
+    // The queue starts a restored seed's missing-file watch from this, so a
+    // dropped listener would leave those seeds unwatched.
+    const torrent = (engine as unknown as { torrents: Map<string, EventEmitter> }).torrents.get("test-id");
+    expect(onReady).not.toHaveBeenCalled();
+    torrent?.emit("ready");
+    expect(onReady).toHaveBeenCalledTimes(1);
+    engine.destroy();
+  });
+});

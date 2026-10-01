@@ -2,6 +2,22 @@ import { describe, it, expect } from "vitest";
 import { parseCliArgs } from "./args";
 
 describe("parseCliArgs", () => {
+  it.each([
+    [],
+    ["magnet:?xt=urn:btih:abc"],
+    ["./course.torrent"],
+    ["watch", "/srv/incoming", "--to", "/srv/downloads", "--daemon"],
+    ["serve", "--port", "9161", "--daemon"],
+  ])("allows --no-playlist before or after download arguments: %j", (...args) => {
+    const expected = { ...parseCliArgs(args), playlist: false };
+    expect(parseCliArgs(["--no-playlist", ...args])).toEqual(expected);
+    expect(parseCliArgs([...args, "--no-playlist"])).toEqual(expected);
+  });
+  it("rejects --no-playlist for commands that do not create playlists", () => {
+    expect(parseCliArgs(["files", "--no-playlist"]).kind).toBe("invalid");
+    expect(parseCliArgs(["attach", "--no-playlist"]).kind).toBe("invalid");
+    expect(parseCliArgs(["seed", "./course", "--no-playlist"]).kind).toBe("invalid");
+  });
   it("defaults to run with no args", () => {
     expect(parseCliArgs([])).toEqual({ kind: "run" });
   });
@@ -39,6 +55,34 @@ describe("parseCliArgs", () => {
   it("parses update, with and without --force", () => {
     expect(parseCliArgs(["update"])).toEqual({ kind: "update", force: false });
     expect(parseCliArgs(["update", "--force"])).toEqual({ kind: "update", force: true });
+  });
+  it("parses headless searches", () => {
+    expect(parseCliArgs(["search", "ubuntu"])).toEqual({ kind: "search", query: "ubuntu" });
+    expect(parseCliArgs(["search", "example", "movie", "--category", "movies"])).toEqual({
+      kind: "search",
+      query: "example movie",
+      category: "movies",
+    });
+    expect(parseCliArgs(["search", "--category", "games", "ubuntu"])).toEqual({
+      kind: "search",
+      query: "ubuntu",
+      category: "games",
+    });
+  });
+  it("rejects invalid headless searches", () => {
+    expect(parseCliArgs(["search"])).toEqual({ kind: "invalid", arg: "search (missing query)" });
+    expect(parseCliArgs(["search", "ubuntu", "--category", "books"])).toEqual({
+      kind: "invalid",
+      arg: "search (invalid category 'books')",
+    });
+    expect(parseCliArgs(["search", "ubuntu", "--limit", "10"])).toEqual({
+      kind: "invalid",
+      arg: "search (unknown --limit)",
+    });
+    expect(parseCliArgs(["search", "ubuntu", "--category"])).toEqual({
+      kind: "invalid",
+      arg: "search (invalid --category)",
+    });
   });
   it("parses watch with a directory", () => {
     expect(parseCliArgs(["watch", "/srv/blackhole"])).toEqual({
@@ -170,5 +214,30 @@ describe("parseCliArgs", () => {
       dir: "/mnt/media",
       daemon: true,
     });
+  });
+});
+
+describe("seed", () => {
+  it("takes the path, and the flags the other headless modes take", () => {
+    expect(parseCliArgs(["seed", "./album"])).toEqual({
+      kind: "seed",
+      path: "./album",
+      seedTimeMs: undefined,
+      deleteFiles: false,
+      daemon: false,
+    });
+    expect(parseCliArgs(["seed", "--seed-time", "2h", "--daemon", "./album"])).toEqual({
+      kind: "seed",
+      path: "./album",
+      seedTimeMs: 2 * 60 * 60 * 1000,
+      deleteFiles: false,
+      daemon: true,
+    });
+  });
+
+  // Without a path there is nothing to hash, and defaulting to the cwd would
+  // make a bare `torlnk seed` start hashing a home directory.
+  it("is invalid with no path", () => {
+    expect(parseCliArgs(["seed"])).toEqual({ kind: "invalid", arg: "seed (missing path)" });
   });
 });

@@ -1,12 +1,15 @@
 import { isInfoHash } from "../sources/magnet";
 import { parseDuration } from "../util/duration";
 
+export type SearchCategory = "games" | "movies" | "tv" | "anime";
+
 export type CliCommand =
   | { kind: "version" }
   | { kind: "help" }
-  | { kind: "run"; initialMagnet?: string; initialTorrent?: string }
+  | { kind: "run"; initialMagnet?: string; initialTorrent?: string; playlist?: boolean }
   | {
       kind: "watch";
+      playlist?: boolean;
       dir: string;
       downloadDir?: string;
       seedTimeMs?: number;
@@ -15,6 +18,7 @@ export type CliCommand =
     }
   | {
       kind: "serve";
+      playlist?: boolean;
       port?: number;
       host?: string;
       token?: string;
@@ -23,9 +27,17 @@ export type CliCommand =
       deleteFiles?: boolean;
       daemon?: boolean;
     }
+  | {
+      kind: "seed";
+      path: string;
+      seedTimeMs?: number;
+      deleteFiles?: boolean;
+      daemon?: boolean;
+    }
   | { kind: "files"; port?: number; host?: string; token?: string; dir?: string; daemon?: boolean }
   | { kind: "attach" }
   | { kind: "update"; force?: boolean }
+  | { kind: "search"; query: string; category?: SearchCategory }
   | { kind: "invalid"; arg: string };
 
 // Valueless boolean flags for the headless subcommands (everything else is a
@@ -70,6 +82,16 @@ function seedTimeFrom(raw: string | undefined): number | undefined {
 }
 
 export function parseCliArgs(argv: string[]): CliCommand {
+  const noPlaylist = argv.includes("--no-playlist");
+  const cmd = parseCommand(argv.filter((arg) => arg !== "--no-playlist"));
+  if (!noPlaylist || cmd.kind === "invalid" || cmd.kind === "help" || cmd.kind === "version") return cmd;
+  if (cmd.kind === "run" || cmd.kind === "watch" || cmd.kind === "serve") {
+    return { ...cmd, playlist: false };
+  }
+  return { kind: "invalid", arg: "--no-playlist (use with the TUI, watch, or serve)" };
+}
+
+function parseCommand(argv: string[]): CliCommand {
   const args = argv.filter((a) => a.trim() !== "");
   if (args.length === 0) return { kind: "run" };
   const a = args[0]!;
@@ -77,6 +99,28 @@ export function parseCliArgs(argv: string[]): CliCommand {
   if (a === "--help" || a === "-h") return { kind: "help" };
   if (a === "attach") return { kind: "attach" };
   if (a === "update") return { kind: "update", force: args.slice(1).includes("--force") };
+  if (a === "search") {
+    const { flags, rest } = readFlags(args.slice(1));
+    const unknownFlag = Object.keys(flags).find((flag) => flag !== "category");
+    const danglingFlag = rest.find((arg) => arg.startsWith("--"));
+    if (unknownFlag) return { kind: "invalid", arg: `search (unknown --${unknownFlag})` };
+    if (danglingFlag) return { kind: "invalid", arg: `search (invalid ${danglingFlag})` };
+
+    const query = rest.join(" ").trim();
+    if (!query) return { kind: "invalid", arg: "search (missing query)" };
+
+    const category = flags.category;
+    if (category === undefined) return { kind: "search", query };
+    if (
+      category === "games" ||
+      category === "movies" ||
+      category === "tv" ||
+      category === "anime"
+    ) {
+      return { kind: "search", query, category };
+    }
+    return { kind: "invalid", arg: `search (invalid category '${category}')` };
+  }
   if (a === "watch") {
     const { bools, rest: r0 } = splitBooleans(args.slice(1));
     const { flags, rest } = readFlags(r0);
@@ -100,6 +144,19 @@ export function parseCliArgs(argv: string[]): CliCommand {
       host: flags.host,
       token: flags.token,
       downloadDir: flags.to ?? flags.dir,
+      seedTimeMs: seedTimeFrom(flags["seed-time"]),
+      deleteFiles: bools.has("delete-files"),
+      daemon: bools.has("daemon"),
+    };
+  }
+  if (a === "seed") {
+    const { bools, rest: r0 } = splitBooleans(args.slice(1));
+    const { flags, rest } = readFlags(r0);
+    const target = rest[0];
+    if (!target) return { kind: "invalid", arg: "seed (missing path)" };
+    return {
+      kind: "seed",
+      path: target,
       seedTimeMs: seedTimeFrom(flags["seed-time"]),
       deleteFiles: bools.has("delete-files"),
       daemon: bools.has("daemon"),
@@ -129,6 +186,9 @@ usage
   torlnk                      open the search TUI
   torlnk "magnet:?xt=..."     start a download on launch
   torlnk path/to/file.torrent open a .torrent file on launch
+  torlnk search <query>        headless: print search results as JSON
+    [--category games|movies|tv|anime]
+  torlnk seed <path>          headless: share files you already have
   torlnk watch <dir>          headless: download torrents dropped into <dir>
   torlnk serve                headless: HTTP add API (POST /add) on :9161
   torlnk files                headless: serve downloads over HTTP on :9160
@@ -141,13 +201,27 @@ once open: type to search every source at once, enter to run, arrows to move,
 d to download, ? for keys
 tip: quote magnet links (they contain & characters)
 
+playlists (TUI/watch/serve): finished downloads automatically get a
+playlist.m3u in each folder containing 2+ audio/video files, including nested
+folders, in natural filename order. Single-file folders are skipped and
+existing playlists are kept. Pass --no-playlist (or set TORLINK_NO_PLAYLIST=1)
+to disable creation; existing playlists remain on disk.
+
 watch mode (no TUI): drop a .torrent, or a .magnet/.txt holding a magnet or
 info hash, into <dir> and it downloads then seeds. Add --to <dir> to choose
 where files land. Handled files move to <dir>/.processed (or /.failed).
 
-seed mode (watch/serve): --seed-time <dur> stops seeding a torrent that long
+seed a path (no TUI): torlnk seed ./album turns the folder into a torrent,
+saves album.torrent next to it, prints the magnet, and starts sharing. Send
+anyone the magnet and they pull the files from you. Takes --seed-time,
+--delete-files and --daemon.
+
+seed expiry (seed/watch/serve): --seed-time <dur> stops seeding a torrent that long
 after it finishes (e.g. 1h, 30m, 90s, 2d); files are kept by default. Add
 --delete-files to also remove the downloaded data when the timer expires.
+One torrent can carry its own limit over the serve API (seedTime on /add, or
+the seed-time control action); that wins over --seed-time, and 0 keeps it
+seeding for good.
 
 --daemon (watch/serve/files): background the process (own session, logs to a
 file), so you can log out and it keeps running. Prints the pid and log path.
@@ -158,6 +232,13 @@ left off. Downloads and seeds keep running while detached.
 
 serve mode (no TUI): a small HTTP API for handing torlink a magnet.
   POST /add {"magnet":"..."}   queue a magnet or info hash
+       ... "seedTime":"30d"      optional: this torrent's own seed limit
+                                (0 = never stop); overrides --seed-time
+  POST /add {"torrent":"<b64>"} queue an uploaded .torrent (base64 or data: URI)
+  POST /control {"id":"...","action":"seed-time","seedTime":"30d"}
+                               change a torrent's seed limit ("" = inherit);
+                               other actions: pause, resume, start-seed,
+                               stop-seed, remove, delete
   GET  /downloads              list active downloads and seeds
   GET  /health                 liveness (no auth)
 flags: --port <n> (default 9161), --host <addr> (default 127.0.0.1),

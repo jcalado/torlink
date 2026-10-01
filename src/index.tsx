@@ -29,7 +29,13 @@ if (cmd.kind === "invalid") {
 // try/catch or error event can reach (see util/crashlog.ts). Contained and
 // logged for every mode; headless runs also echo one line to their log.
 containUnhandledRejections({
-  echo: cmd.kind === "update" || cmd.kind === "watch" || cmd.kind === "serve" || cmd.kind === "files",
+  echo:
+    cmd.kind === "update" ||
+    cmd.kind === "search" ||
+    cmd.kind === "watch" ||
+    cmd.kind === "seed" ||
+    cmd.kind === "serve" ||
+    cmd.kind === "files",
 });
 
 // Run/reattach the TUI inside a persistent tmux session (execs tmux, then exits).
@@ -50,10 +56,17 @@ if (cmd.kind === "update") {
   void import("./update/run").then(({ runUpdate }) => runUpdate({ force: cmd.force }).catch(failHeadless));
 } else if (cmd.kind === "watch") {
   if (cmd.daemon) daemonize("watch"); // parent exits here; the detached child continues
-  const { dir, downloadDir, seedTimeMs, deleteFiles } = cmd;
+  const { dir, downloadDir, seedTimeMs, deleteFiles, playlist } = cmd;
   void import("./daemon/watch").then(({ runWatch }) =>
-    runWatch(dir, downloadDir, { seedTimeMs, deleteFiles }).catch(failHeadless),
+    runWatch(dir, downloadDir, { seedTimeMs, deleteFiles, playlist }).catch(failHeadless),
   );
+} else if (cmd.kind === "seed") {
+  if (cmd.daemon) daemonize("seed");
+  const { path: target, seedTimeMs, deleteFiles } = cmd;
+  void import("./daemon/seed")
+    .then(({ runSeed }) => runSeed(target, { seedTimeMs, deleteFiles }))
+    .then(() => process.exit(0))
+    .catch(failHeadless);
 } else if (cmd.kind === "serve") {
   if (cmd.daemon) daemonize("serve");
   const options = {
@@ -61,10 +74,14 @@ if (cmd.kind === "update") {
     host: cmd.host,
     token: cmd.token ?? process.env.TORLINK_API_TOKEN,
     downloadDir: cmd.downloadDir,
+    playlist: cmd.playlist,
     seedTimeMs: cmd.seedTimeMs,
     deleteFiles: cmd.deleteFiles,
   };
-  void import("./daemon/serve").then(({ runServe }) => runServe(options).catch(failHeadless));
+  void import("./daemon/serve")
+    .then(({ runServe }) => runServe(options))
+    .then(() => process.exit(0))
+    .catch(failHeadless);
 } else if (cmd.kind === "files") {
   if (cmd.daemon) daemonize("files");
   const options = {
@@ -74,6 +91,17 @@ if (cmd.kind === "update") {
     dir: cmd.dir,
   };
   void import("./daemon/files").then(({ runFiles }) => runFiles(options).catch(failHeadless));
+} else if (cmd.kind === "search") {
+  // One JSON document on stdout, then exit: the shape a script can pipe into
+  // jq. Exit 1 only when every source failed, so an empty-but-healthy search
+  // is still a success.
+  void import("./cli/search")
+    .then(({ runSearch }) => runSearch({ query: cmd.query, category: cmd.category }))
+    .then(({ document, exitCode }) => {
+      process.exitCode = exitCode;
+      process.stdout.write(`${JSON.stringify(document)}\n`);
+    })
+    .catch(failHeadless);
 } else {
 
 // Enter the alt-screen and hide the hardware cursor: the TUI draws its own
@@ -112,6 +140,7 @@ const app = render(
   <App
     initialMagnet={cmd.initialMagnet}
     initialTorrent={cmd.initialTorrent}
+    playlist={cmd.playlist}
     onQuit={() => forceExit(0)}
   />,
   { exitOnCtrlC: false },

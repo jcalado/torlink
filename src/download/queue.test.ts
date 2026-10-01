@@ -247,6 +247,121 @@ describe("strayDownload (missing-file safety-net)", () => {
   });
 });
 
+describe("DownloadQueue stray detection on a restored seed", () => {
+  // A restored seed on a fake engine that reports a large torrent mid-check
+  // until a test moves it along. It shows download speed even mid-check, the
+  // worst case for the detector.
+  function restoredSeed(id: string) {
+    const q = new DownloadQueue();
+    const engine = (
+      q as unknown as {
+        engine: {
+          add: (id: string, source: string, dir: string, handlers: AddHandlers) => void;
+          stats: (id: string) => unknown;
+          remove: (id: string) => void;
+        };
+      }
+    ).engine;
+    let handlers: AddHandlers = {};
+    let stats = {
+      progress: 0.3,
+      downloaded: 0,
+      total: 24e9,
+      speed: 2e6,
+      uploadSpeed: 0,
+      uploaded: 0,
+      peers: 3,
+      timeRemaining: Infinity,
+      name: "",
+    };
+    const removed: string[] = [];
+    engine.add = (_id, _source, _dir, given) => {
+      handlers = given;
+    };
+    engine.stats = () => stats;
+    engine.remove = (gone) => removed.push(gone);
+    q.restoreHistory([h({ id })]);
+    q.startSeeding(h({ id }));
+    return {
+      q,
+      removed,
+      handlers: () => handlers,
+      report: (next: Partial<typeof stats>) => {
+        stats = { ...stats, ...next };
+      },
+    };
+  }
+
+  it("leaves a seed alone for as long as webtorrent is still checking it", async () => {
+    vi.useFakeTimers();
+    try {
+      const seed = restoredSeed("check1");
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(seed.q.getSeed("check1")?.status).toBe("seeding");
+      expect(seed.removed).toEqual([]);
+      seed.q.suspend();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("flags a seed still pulling data once the check is done and the grace has run out", async () => {
+    vi.useFakeTimers();
+    try {
+      const seed = restoredSeed("check2");
+      await vi.advanceTimersByTimeAsync(60_000);
+      seed.handlers().onReady?.();
+      await vi.advanceTimersByTimeAsync(9_000);
+      expect(seed.q.getSeed("check2")?.status).toBe("seeding");
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(seed.q.getSeed("check2")?.status).toBe("missing");
+      expect(seed.removed).toEqual(["check2"]);
+      seed.q.suspend();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps seeding when the check finds every piece on disk", async () => {
+    vi.useFakeTimers();
+    try {
+      const seed = restoredSeed("check3");
+      await vi.advanceTimersByTimeAsync(90_000);
+      seed.report({ progress: 1, speed: 0 });
+      seed.handlers().onReady?.();
+      seed.handlers().onDone?.();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(seed.q.getSeed("check3")?.status).toBe("seeding");
+      expect(seed.removed).toEqual([]);
+      seed.q.suspend();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rides out a quick repair of pieces that failed a long check", async () => {
+    vi.useFakeTimers();
+    try {
+      const seed = restoredSeed("check4");
+      // The real sequence: nothing downloads during the check, then the pieces
+      // that failed it are fetched the moment it ends.
+      seed.report({ speed: 0 });
+      await vi.advanceTimersByTimeAsync(60_000);
+      seed.report({ progress: 0.999, speed: 2e6 });
+      seed.handlers().onReady?.();
+      await vi.advanceTimersByTimeAsync(3_000);
+      seed.report({ progress: 1, speed: 0 });
+      seed.handlers().onDone?.();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(seed.q.getSeed("check4")?.status).toBe("seeding");
+      expect(seed.removed).toEqual([]);
+      seed.q.suspend();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("DownloadQueue error resilience on boot", () => {
   it("restore() marks item failed if engine.add throws synchronously", () => {
     const q = new DownloadQueue();
@@ -295,5 +410,47 @@ describe("DownloadQueue error resilience on boot", () => {
 
     expect(q.getSeed("h-broken")?.status).toBe("paused");
     q.suspend();
+  });
+});
+
+describe("DownloadQueue per-torrent seed time", () => {
+  it("setSeedTime updates a history entry and clears it again with undefined", () => {
+    const q = new DownloadQueue();
+    q.restoreHistory([h({ id: "st1" })]);
+    expect(q.setSeedTime("st1", 86_400_000)).toBe(true);
+    expect(q.getHistory()[0]?.seedTimeMs).toBe(86_400_000);
+    expect(q.setSeedTime("st1", undefined)).toBe(true);
+    expect("seedTimeMs" in q.getHistory()[0]!).toBe(false);
+  });
+
+  it("setSeedTime reaches a download that has not finished yet", () => {
+    const q = new DownloadQueue();
+    // Safe mode brings the item back paused without starting an engine.
+    q.restore(
+      [
+        {
+          id: "st2",
+          name: "Still going",
+          magnet: "magnet:?xt=urn:btih:st2",
+          dir: "/d",
+          status: "downloading",
+          progress: 0.2,
+          totalBytes: 10,
+          downloadedBytes: 2,
+          speed: 0,
+          peers: 0,
+          addedAt: 1,
+        },
+      ],
+      { safe: true },
+    );
+    expect(q.setSeedTime("st2", 0)).toBe(true);
+    expect(q.getItems().find((it) => it.id === "st2")?.seedTimeMs).toBe(0);
+    q.suspend();
+  });
+
+  it("setSeedTime reports an id it has never seen", () => {
+    const q = new DownloadQueue();
+    expect(q.setSeedTime("nope", 1000)).toBe(false);
   });
 });
